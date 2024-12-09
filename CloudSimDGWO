@@ -1,0 +1,447 @@
+package org.cloudbus.cloudsim.examples;
+
+import org.cloudbus.cloudsim.*;
+import org.cloudbus.cloudsim.core.CloudSim;
+import org.cloudbus.cloudsim.provisioners.*;
+
+import java.text.DecimalFormat;
+import java.util.*;
+
+public class CloudSimDGWOTest3T {
+    protected static List<Cloudlet> cloudletList;
+    protected static List<Vm> vmList;
+    protected static final int WOLF_POPULATION = 100;
+    protected static final int MAX_ITERATIONS = 50;
+    protected static final int NUM_ISLANDS = 10; //numbrer of islands(s)
+    protected static final int MIGRATION_FREQUENCY = 5;//migration frequency Mf
+    protected static final double MIGRATION_RATE = 0.1;//migration rate Mr
+
+    // DGWO parameters
+    protected static double a;
+    protected static final int SEARCH_AGENTS_PER_ISLAND = 10; // WOLF_POPULATION/s
+    protected static final int DIMENSION = 50; //a solution vector 
+
+    protected static class Island {
+        double[][] positions;
+        double[][] alphaPos;
+        double[][] betaPos;
+        double[][] deltaPos;
+        double alphaScore;
+        double betaScore;
+        double deltaScore;
+
+        public Island() {
+            positions = new double[SEARCH_AGENTS_PER_ISLAND][DIMENSION];
+            alphaPos = new double[1][DIMENSION];
+            betaPos = new double[1][DIMENSION];
+            deltaPos = new double[1][DIMENSION];
+            alphaScore = Double.POSITIVE_INFINITY;
+            betaScore = Double.POSITIVE_INFINITY;
+            deltaScore = Double.POSITIVE_INFINITY;
+        }
+
+        
+      //Initializing wolves' positions randomly
+        public void initializePositions(Random rand) { 
+            for (int i = 0; i < SEARCH_AGENTS_PER_ISLAND; i++) {
+                for (int j = 0; j < DIMENSION; j++) {
+                    positions[i][j] = rand.nextInt(vmList.size());
+                }
+            }
+        }
+    }
+
+    public static void main(String[] args) {
+        try {
+            int num_user = 1; // to understand how many user entities are in the simulation
+            Calendar calendar = Calendar.getInstance(); //define the start time of the simulation
+            boolean trace_flag = false; //decide whether event tracing should be enabled or disabled
+
+            // Initialize CloudSim
+            CloudSim.init(num_user, calendar, trace_flag);
+
+            // Create Datacenter
+            Datacenter datacenter0 = createDatacenter("Datacenter_0", 0);
+
+            // Create Broker
+            DatacenterBroker broker = createBroker();
+            int brokerId = broker.getId();
+
+            // Create VMs and Cloudlets
+            vmList = createVMs(brokerId);
+            cloudletList = createCloudlets(brokerId);
+
+            // Submit VM list to broker
+            broker.submitVmList(vmList);
+
+            // Apply Enhanced DGWO Algorithm
+            List<Cloudlet> optimizedCloudlets = applyDGWO3();
+
+            // Submit cloudlet list to broker
+            broker.submitCloudletList(optimizedCloudlets);
+
+            // Start simulation
+            CloudSim.startSimulation();
+
+            // Stop simulation
+            CloudSim.stopSimulation();
+
+            // Print results
+            List<Cloudlet> newList = broker.getCloudletReceivedList();
+            printCloudletList(newList);
+
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+    }
+
+  //Distributed Grey Wolf Optimizer
+	public static List<Cloudlet> applyDGWO3() { 
+        Island[] islands = new Island[NUM_ISLANDS];
+        double[][] globalBestPosition = new double[1][DIMENSION]; //best solution found globally across all islands
+        double globalBestScore = Double.POSITIVE_INFINITY;// initial score
+
+        // Initialize islands
+        Random rand = new Random(); 
+        for (int i = 0; i < NUM_ISLANDS; i++) {
+            islands[i] = new Island();
+            islands[i].initializePositions(rand); // random initialize the positions of the wolves
+        }
+
+        // Main loop
+        for (int iteration = 0; iteration < MAX_ITERATIONS; iteration++) {
+            
+            a = 2 - iteration * (2.0 / MAX_ITERATIONS); //controls the exploration and exploitation behavior of the wolves
+
+            // Process in each island
+            for (int islandIndex = 0; islandIndex < NUM_ISLANDS; islandIndex++) {
+                Island island = islands[islandIndex];
+
+                // Evaluate each wofls in the island
+                for (int i = 0; i < SEARCH_AGENTS_PER_ISLAND; i++) {
+                    double fitness = calculateFitnessWithTransmissionCost(island.positions[i]); //fitness is based on both execution time and transmission cost
+
+                    // Update Alpha, Beta, and Delta wolfs
+                    if (fitness < island.alphaScore) {
+                        island.alphaScore = fitness; //The best solution (smallest fitness value) in the island.
+                        System.arraycopy(island.positions[i], 0, island.alphaPos[0], 0, DIMENSION);
+
+                        // Update global best
+                        if (fitness < globalBestScore) {
+                            globalBestScore = fitness;
+                            System.arraycopy(island.positions[i], 0, globalBestPosition[0], 0, DIMENSION);
+                        }
+                    } else if (fitness > island.alphaScore && fitness < island.betaScore) {
+                        island.betaScore = fitness;//The second-best solution.
+                        System.arraycopy(island.positions[i], 0, island.betaPos[0], 0, DIMENSION);
+                    } else if (fitness > island.alphaScore && fitness > island.betaScore && fitness < island.deltaScore) {
+                        island.deltaScore = fitness;//The third-best solution.
+                        System.arraycopy(island.positions[i], 0, island.deltaPos[0], 0, DIMENSION);
+                    }
+                }
+
+                // Update positions within island using LOV method
+                updatePositionsWithLOV(island, rand);
+            }
+
+            // Perform migration if needed
+            //if (a <= 1.0 && iteration > 0 && iteration % MIGRATION_FREQUENCY == 0) {
+            if (iteration > 0 && iteration % MIGRATION_FREQUENCY == 0) {
+                performMigration(islands);
+            }
+        }
+
+        // Apply the global best solution
+        return applySchedulingSolution(globalBestPosition[0]);
+    }
+
+    protected static void performMigration(Island[] islands) {
+        int numMigrants = (int) (SEARCH_AGENTS_PER_ISLAND * MIGRATION_RATE);
+        Random rand = new Random();
+
+        for (int i = 0; i < NUM_ISLANDS; i++) {
+        	int nextIsland = (i + 1 + rand.nextInt(NUM_ISLANDS - 1)) % NUM_ISLANDS;//Random ring methord
+            Island currentIsland = islands[i]; //best wolves in the currentIsland are assumed to be at the beginning of the positions array
+            Island targetIsland = islands[nextIsland]; //the worst wolves are assumed to be at the end of the positions array
+
+            // Select best solutions from current island
+            for (int j = 0; j < numMigrants; j++) {
+                // Replace worst solutions in target island with best solutions from current island
+                System.arraycopy(currentIsland.positions[j], 0, 
+                    targetIsland.positions[SEARCH_AGENTS_PER_ISLAND - 1 - j], 0, DIMENSION); //
+            }
+        }
+    }
+
+	protected static double calculateFitnessWithTransmissionCost(double[] position) {
+        double totalExecutionTime = 0; // total execution time of all cloudlets. This is the time taken to complete all cloudlets
+        double totalTransmissionCost = 0; //total data transmission cost, transfer between devices
+        double[] vmLoadTime = new double[vmList.size()];
+
+        for (int i = 0; i < position.length; i++) {
+            int vmIndex = (int) position[i]; //Each element in position represents the index of the VM to which a specific cloudlet is assigned
+            Cloudlet cloudlet = cloudletList.get(i);
+            Vm vm = vmList.get(vmIndex);
+
+            // Calculate execution time for this cloudlet on the assigned VM
+            double executionTime = cloudlet.getCloudletLength() / vm.getMips(); //vm.getMips Represents the Million Instructions Per Second (MIPS) that the VM can process.
+            vmLoadTime[vmIndex] += executionTime;
+            totalExecutionTime = Math.max(totalExecutionTime, vmLoadTime[vmIndex]);
+
+            // Calculate data transmission cost for the cloudlet
+            totalTransmissionCost += calculateTransmissionCost(cloudlet, vm);
+        }
+
+        return totalExecutionTime + totalTransmissionCost;
+									
+    }
+
+    protected static double calculateTransmissionCost(Cloudlet cloudlet, Vm vm) {
+        // Calculate the transmission cost based on data size and network load
+        
+	 double bandwidthBytesPerSec = (1000 * 1024 * 1024) / 8.0; //1000Mbps(bits per second) ---->  bandwidth in bytes per second.
+	 double dataSizeBytes = cloudlet.getCloudletFileSize();
+     double transmissionTime = dataSizeBytes / bandwidthBytesPerSec;
+     //double transmissionTime = cloudlet.getCloudletLength() / bandwidthBytesPerSec;
+     //double costPerSecond = 0.01;
+     return transmissionTime; //* costPerSecond;
+    }
+																
+																						
+									  
+    // updating the positions of wolves											  
+    protected static void updatePositionsWithLOV(Island island, Random rand) {
+    	// loop iterates over all wolves within the current island
+        for (int i = 0; i < SEARCH_AGENTS_PER_ISLAND; i++) {
+            double[] tempPosition = new double[DIMENSION];
+            for (int j = 0; j < DIMENSION; j++) {
+                double r1 = rand.nextDouble();
+                double r2 = rand.nextDouble();
+
+                double A1 = 2 * a * r1 - a;
+                double C1 = 2 * r2;
+
+                double D_alpha = Math.abs(C1 * island.alphaPos[0][j] - island.positions[i][j]);
+                double X1 = island.alphaPos[0][j] - A1 * D_alpha;
+
+                r1 = rand.nextDouble();
+                r2 = rand.nextDouble();
+
+                double A2 = 2 * a * r1 - a;
+                double C2 = 2 * r2;
+
+                double D_beta = Math.abs(C2 * island.betaPos[0][j] - island.positions[i][j]);
+                double X2 = island.betaPos[0][j] - A2 * D_beta;
+
+                r1 = rand.nextDouble();
+                r2 = rand.nextDouble();
+
+                double A3 = 2 * a * r1 - a;
+                double C3 = 2 * r2;
+
+                double D_delta = Math.abs(C3 * island.deltaPos[0][j] - island.positions[i][j]);
+                double X3 = island.deltaPos[0][j] - A3 * D_delta;
+
+                tempPosition[j] = ( X1 + X2 + X3 ) / 3;
+            }
+            // Apply LOV method to discretize the position
+            int[] sortedIndices = sortIndicesByValue(tempPosition);
+            for (int j = 0; j < DIMENSION; j++) {
+                island.positions[i][j] = sortedIndices[j] % vmList.size();//each cloudlet is mapped to a VM
+            }
+        }
+    }
+    // determine the order of the indices in the values array based on the ascending order of the corresponding values
+    protected static int[] sortIndicesByValue(double[] values) {
+        Integer[] indices = new Integer[values.length];
+        for (int i = 0; i < values.length; i++) {
+            indices[i] = i;
+        }
+        Arrays.sort(indices, Comparator.comparingDouble(i -> values[i]));
+        return Arrays.stream(indices).mapToInt(i -> i).toArray();
+    }
+
+ 
+    static Datacenter createDatacenter(String name, int d) {
+        Scanner scanner = new Scanner(System.in);
+        int hostID = 0;
+        int ram = 16000;
+        int storage = 100000;
+        int bw = 100000;
+        int mips = 100000;
+        int hostNum = 0;
+        int resourceScaler = 1;
+        List<Host> hostList = new ArrayList<Host>();
+        
+        System.out.print("How many host machines for the Datacentre?: ");
+        hostNum = scanner.nextInt();
+        
+        for (int i = 0; i < hostNum; i++) {
+            List<Pe> peList = new ArrayList<>();
+            peList.add(new Pe(0, new PeProvisionerSimple(mips * resourceScaler)));
+
+            hostList.add(new Host(
+                hostID, 
+                new RamProvisionerSimple(ram * resourceScaler),
+                new BwProvisionerSimple(bw * resourceScaler), 
+                storage * resourceScaler,
+                peList,
+                new VmSchedulerTimeShared(peList)
+            ));
+            hostID++;
+            resourceScaler++;
+        }
+
+        String arch = "X_86";
+        String os = "Linux";
+        String vmm = "Xen";
+        double timeZone = 10.0;
+        double cost = 3.00;
+        double costPerMem = 0.05;
+        double costPerStorage = 0.001;
+        double costPerBw = 0.1;
+        
+        LinkedList<Storage> storageList = new LinkedList<Storage>();
+        
+        DatacenterCharacteristics characteristics = new DatacenterCharacteristics(
+            arch, os, vmm, hostList, timeZone, cost, costPerMem, costPerStorage, costPerBw
+        );
+        
+        try {
+            return new Datacenter(name, characteristics, new VmAllocationPolicySimple(hostList), storageList, 0);
+        } catch (Exception e) {
+            e.printStackTrace();
+            return null;
+        }
+    }
+    
+    static DatacenterBroker createBroker() {
+        DatacenterBroker broker = null;
+        try {
+            broker = new DatacenterBroker("Broker");
+        } catch (Exception e) {
+            e.printStackTrace();
+            return null;
+        }
+        return broker;
+    }
+    
+ static List<Vm> createVMs(int brokerId) {
+        Scanner scanner = new Scanner(System.in);
+        List<Vm> vms = new ArrayList<Vm>();
+        
+        System.out.print("How many Virtual Machines?: ");
+        int userVM = scanner.nextInt();
+        
+        int vmID = 0;
+        int mips = 1000;
+        long size = 1000;
+        int ram = 1024;
+        long bw = 1000;
+        int pesNumber = 1;
+        String vmm = "Xen";
+        int multiplier = 1;
+        
+        for (int i = 0; i < userVM; i++) {
+            vms.add(new Vm(vmID, brokerId, mips * multiplier, pesNumber * multiplier, 
+                          ram * multiplier, bw * multiplier, size * multiplier, 
+                          vmm, new CloudletSchedulerTimeShared()));
+            vmID++;
+            multiplier++;
+            if (multiplier > 4) {
+                multiplier = 1;
+                ram = 512;
+                mips = 500;
+                bw = 500;
+                pesNumber = 1;
+                size = 500;
+            }
+        }
+       
+        return vms;
+    }
+    
+    static List<Cloudlet> createCloudlets(int brokerId) {
+        Scanner scanner = new Scanner(System.in);
+        List<Cloudlet> cloudlets = new ArrayList<Cloudlet>();
+        
+        System.out.print("How many cloudlets? (Please enter a value under 500): ");
+        int userCloud = scanner.nextInt();
+        
+        while (userCloud > 500) {
+            System.out.println("You have entered a value that exceeds the limitation. Please re-enter here:");
+            userCloud = scanner.nextInt();
+        }
+        
+        int cid = 0;
+        long length = 4000;
+        long fileSize = 300;
+        long outputSize = 300;
+        int pesNumber = 1;
+        UtilizationModel utilizationModel = new UtilizationModelFull();
+        
+        for (int i = 0; i < userCloud; i++) {
+            Cloudlet cloudlet = new Cloudlet(cid, length, pesNumber, fileSize, 
+                                           outputSize, utilizationModel, 
+                                           utilizationModel, utilizationModel);
+            cloudlet.setUserId(brokerId);
+            cloudlets.add(cloudlet);
+            cid++;
+        }
+        
+        return cloudlets;
+    }
+    
+				
+					   
+						
+						  
+					  
+																   
+	
+										 
+																		   
+																	 
+																		   
+									 
+								
+			  
+	 
+					 
+ 
+	
+    private static void printCloudletList(List<Cloudlet> list) {
+        int size = list.size();
+        Cloudlet cloudlet;
+        
+        String indent = "    ";
+        System.out.println();
+        System.out.println("========== OUTPUT ==========");
+        System.out.println("Cloudlet ID" + indent + "STATUS" + indent + "Data center ID" + indent + "VM ID" + indent + "Time" + indent + "Start Time" + indent + "Finish Time");
+        
+        DecimalFormat dft = new DecimalFormat("###.##");
+        for (int i = 0; i < size; i++) {
+            cloudlet = list.get(i);
+            System.out.printf(indent + cloudlet.getCloudletId() + indent + indent);
+            
+            if (cloudlet.getCloudletStatus() == Cloudlet.SUCCESS) {
+                System.out.printf("SUCCESS");
+                System.out.printf(indent + indent + cloudlet.getResourceId() + indent + indent + indent + cloudlet.getVmId() +
+                    indent + indent + dft.format(cloudlet.getActualCPUTime()) + indent + indent + dft.format(cloudlet.getExecStartTime()) +
+                    indent + indent + dft.format(cloudlet.getFinishTime()) + "\n");
+            }
+        }
+    }
+    
+    protected static List<Cloudlet> applySchedulingSolution(double[] solution) {
+        for (int i = 0; i < solution.length; i++) {
+            Cloudlet cloudlet = cloudletList.get(i);
+            int vmIndex = (int) solution[i];
+            cloudlet.setVmId(vmList.get(vmIndex).getId());
+        }
+        return cloudletList;
+    }
+    
+
+    
+}
